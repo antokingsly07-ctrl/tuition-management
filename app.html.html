@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tuition Manager</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="app-layout">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="logo-icon small">TM</div>
+        <span>Tuition Manager</span>
+      </div>
+
+      <div class="section-switch" id="section-switch">
+        <button class="section-btn active" data-section="tuition">📘 Tuition</button>
+        <button class="section-btn" data-section="typewriting">⌨️ Typewriting</button>
+      </div>
+
+      <nav class="side-nav" id="side-nav">
+        <a href="#" data-page="dashboard" class="active">Dashboard</a>
+        <a href="#" data-page="students">Students</a>
+        <a href="#" data-page="fees">Fees</a>
+        <a href="#" data-page="attendance">Attendance</a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="user-info">
+          <span id="user-name"></span>
+          <small id="user-role"></small>
+        </div>
+        <button id="logout-btn" class="btn btn-ghost btn-sm">Logout</button>
+      </div>
+    </aside>
+
+    <main class="main-content" id="main-content">
+      <!-- rendered by JS -->
+    </main>
+  </div>
+
+  <!-- Modal -->
+  <div class="modal-overlay hidden" id="modal-overlay">
+    <div class="modal" id="modal">
+      <div class="modal-head">
+        <h3 id="modal-title"></h3>
+        <button class="modal-close" id="modal-close">&times;</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="js/storage.js"></script>
+  <script src="js/auth.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
