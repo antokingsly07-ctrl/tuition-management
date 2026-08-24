@@ -77,6 +77,17 @@ const DB = (() => {
     return mem || seed();
   }
 
+  /* defensive: guarantees writes never hit a null cache,
+     even if called before init() resolves (stale tabs etc.) */
+  function ensureMem() {
+    if (!mem) {
+      console.warn("[DB] write attempted before init — using local fallback");
+      const raw = localStorage.getItem(LOCAL_KEY);
+      mem = raw ? JSON.parse(raw) : seed();
+      persistLocal();
+    }
+  }
+
   function uid(prefix = "") {
     return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   }
@@ -90,6 +101,7 @@ const DB = (() => {
       });
     }
     // local fallback
+    ensureMem();
     const user = mem.users.find(u => u.username === username && u.password === password);
     if (!user) return null;
     const { password: _pw, ...safe } = user;
@@ -98,6 +110,7 @@ const DB = (() => {
 
   /* ---------- granular writes ---------- */
   async function addStudent(student) {
+    ensureMem();
     student.id = student.id || uid("s_");
     mem.students.push(student);
     persistLocal();
@@ -109,6 +122,7 @@ const DB = (() => {
   }
 
   async function updateStudent(id, patch) {
+    ensureMem();
     const s = mem.students.find(x => x.id === id);
     if (s) Object.assign(s, patch);
     persistLocal();
@@ -119,6 +133,7 @@ const DB = (() => {
   }
 
   async function deleteStudent(id) {
+    ensureMem();
     mem.students = mem.students.filter(x => x.id !== id);
     mem.payments = mem.payments.filter(p => p.studentId !== id);
     mem.attendance.forEach(a => delete a.records[id]);
@@ -130,6 +145,7 @@ const DB = (() => {
   }
 
   async function addPayment(payment) {
+    ensureMem();
     payment.id = payment.id || uid("p_");
     mem.payments.push(payment);
     persistLocal();
@@ -141,6 +157,7 @@ const DB = (() => {
   }
 
   async function deletePayment(id) {
+    ensureMem();
     mem.payments = mem.payments.filter(p => p.id !== id);
     persistLocal();
     if (remote) {
@@ -150,6 +167,7 @@ const DB = (() => {
   }
 
   async function saveAttendance(date, section, records) {
+    ensureMem();
     const existing = mem.attendance.find(a => a.date === date && a.section === section);
     if (existing) existing.records = records;
     else mem.attendance.push({ id: uid("a_"), date, section, records });
