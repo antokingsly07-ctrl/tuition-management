@@ -270,46 +270,32 @@ window.openStudentForm = function (id = null) {
     </form>
   `);
 
-  document.getElementById("student-form").addEventListener("submit", e => {
+  document.getElementById("student-form").addEventListener("submit", async e => {
     e.preventDefault();
     const f = new FormData(e.target);
-    const db = DB.load();
+    const patch = {
+      name: f.get("name").trim(),
+      phone: f.get("phone").trim(),
+      batch: f.get("batch").trim(),
+      monthlyFee: Number(f.get("monthlyFee")),
+      joinDate: f.get("joinDate"),
+      active: f.get("active") === "true"
+    };
     if (s) {
-      Object.assign(db.students.find(x => x.id === s.id), {
-        name: f.get("name").trim(),
-        phone: f.get("phone").trim(),
-        batch: f.get("batch").trim(),
-        monthlyFee: Number(f.get("monthlyFee")),
-        joinDate: f.get("joinDate"),
-        active: f.get("active") === "true"
-      });
+      await DB.updateStudent(s.id, patch);
     } else {
-      db.students.push({
-        id: DB.uid("s_"),
-        name: f.get("name").trim(),
-        phone: f.get("phone").trim(),
-        batch: f.get("batch").trim(),
-        monthlyFee: Number(f.get("monthlyFee")),
-        joinDate: f.get("joinDate"),
-        section: state.section,
-        active: f.get("active") === "true"
-      });
+      await DB.addStudent({ ...patch, section: state.section });
     }
-    DB.save(db);
     closeModal();
     toast(s ? "Student updated" : "Student added");
     render();
   });
 };
 
-window.deleteStudent = function (id) {
+window.deleteStudent = async function (id) {
   const s = studentById(id);
   if (!confirm(`Delete "${s.name}"? Their payment history will also be removed.`)) return;
-  const db = DB.load();
-  db.students = db.students.filter(x => x.id !== id);
-  db.payments = db.payments.filter(p => p.studentId !== id);
-  db.attendance.forEach(a => delete a.records[id]);
-  DB.save(db);
+  await DB.deleteStudent(id);
   toast("Student deleted");
   render();
 };
@@ -389,19 +375,16 @@ window.openPaymentForm = function (studentId, month) {
     </form>
   `);
 
-  document.getElementById("payment-form").addEventListener("submit", e => {
+  document.getElementById("payment-form").addEventListener("submit", async e => {
     e.preventDefault();
     const f = new FormData(e.target);
-    const db = DB.load();
-    db.payments.push({
-      id: DB.uid("p_"),
+    await DB.addPayment({
       studentId,
       amount: Number(f.get("amount")),
       month,
       date: f.get("date"),
       note: f.get("note").trim()
     });
-    DB.save(db);
     closeModal();
     toast("Payment recorded");
     render();
@@ -429,11 +412,9 @@ window.openHistory = function (studentId) {
   ` : `<div class="empty-state">No payments recorded for this student.</div>`);
 };
 
-window.deletePayment = function (payId, studentId) {
+window.deletePayment = async function (payId, studentId) {
   if (!confirm("Delete this payment record?")) return;
-  const db = DB.load();
-  db.payments = db.payments.filter(p => p.id !== payId);
-  DB.save(db);
+  await DB.deletePayment(payId);
   toast("Payment deleted");
   openHistory(studentId);
   render();
@@ -522,23 +503,32 @@ window.markAll = function (val) {
   updateAttSummary();
 };
 
-window.saveAttendance = function (date) {
+window.saveAttendance = async function (date) {
   const records = collectAttendance();
   const total = studentsOf().filter(s => s.active).length;
   if (Object.keys(records).length < total) {
     if (!confirm("Some students are unmarked. Save anyway?")) return;
   }
-  const db = DB.load();
-  const existing = db.attendance.find(a => a.date === date && a.section === state.section);
-  if (existing) {
-    existing.records = records;
-  } else {
-    db.attendance.push({ id: DB.uid("a_"), date, section: state.section, records });
-  }
-  DB.save(db);
+  await DB.saveAttendance(date, state.section, records);
   toast("Attendance saved");
   render();
 };
 
-/* ----- boot ----- */
-render();
+/* ----- boot: load data, then render ----- */
+(async function boot() {
+  const body = document.getElementById("page-body");
+  body.innerHTML = `<div class="empty-state">Loading data…</div>`;
+  try {
+    await DB.init();
+    DB.onWriteError = (scope, err) => toast("Save failed — check connection", "error");
+    render();
+  } catch (err) {
+    console.error(err);
+    body.innerHTML = `
+      <div class="empty-state">
+        <p><strong>Could not load data.</strong></p>
+        <p style="margin-top:6px">Check your internet connection or Supabase configuration.</p>
+        <button class="btn btn-primary" style="margin-top:14px" onclick="location.reload()">Retry</button>
+      </div>`;
+  }
+})();
