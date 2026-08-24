@@ -113,7 +113,7 @@ const DB = (() => {
     if (s) Object.assign(s, patch);
     persistLocal();
     if (remote) {
-      try { await api("students/" + encodeURIComponent(id), { method: "PUT", body: JSON.stringify(patch) }); }
+      try { await api("students?id=" + encodeURIComponent(id), { method: "PUT", body: JSON.stringify(patch) }); }
       catch (err) { fail("updateStudent", err); }
     }
   }
@@ -124,7 +124,7 @@ const DB = (() => {
     mem.attendance.forEach(a => delete a.records[id]);
     persistLocal();
     if (remote) {
-      try { await api("students/" + encodeURIComponent(id), { method: "DELETE" }); }
+      try { await api("students?id=" + encodeURIComponent(id), { method: "DELETE" }); }
       catch (err) { fail("deleteStudent", err); }
     }
   }
@@ -144,7 +144,7 @@ const DB = (() => {
     mem.payments = mem.payments.filter(p => p.id !== id);
     persistLocal();
     if (remote) {
-      try { await api("payments/" + encodeURIComponent(id), { method: "DELETE" }); }
+      try { await api("payments?id=" + encodeURIComponent(id), { method: "DELETE" }); }
       catch (err) { fail("deletePayment", err); }
     }
   }

@@ -1,4 +1,4 @@
-/* Shared MongoDB connection (cached across serverless invocations) */
+/* Shared MongoDB connection + request handler (cached across invocations) */
 
 const { MongoClient } = require("mongodb");
 
@@ -42,4 +42,28 @@ async function ensureSeed(db) {
   }
 }
 
-module.exports = { getDb, ensureSeed };
+const clean = doc => {
+  const c = { ...doc };
+  delete c._id;
+  return c;
+};
+
+function newId(prefix) {
+  return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+/* wraps each endpoint with db access, seeding and error handling */
+async function handle(req, res, fn) {
+  res.setHeader("Cache-Control", "no-store");
+  const db = await getDb();
+  if (!db) return res.status(503).json({ error: "MONGODB_URI not configured — running without backend." });
+  try {
+    await ensureSeed(db);
+    await fn(db, req, res);
+  } catch (err) {
+    console.error("[api]", err);
+    res.status(500).json({ error: "Server error", detail: String(err.message || err) });
+  }
+}
+
+module.exports = { getDb, ensureSeed, handle, clean, newId };
