@@ -7,8 +7,8 @@ const Auth = {
   },
 
   /* call only after DB.init() has resolved */
-  login(username, password) {
-    const user = DB.load().users.find(u => u.username === username && u.password === password);
+  async login(username, password) {
+    const user = await DB.authenticate(username, password);
     if (!user) return null;
     const session = { id: user.id, name: user.name, role: user.role, section: user.section || null };
     sessionStorage.setItem("tm_session", JSON.stringify(session));
@@ -44,7 +44,7 @@ if (loginForm) {
 
     try {
       await DB.init();
-      const user = Auth.login(username, password);
+      const user = await Auth.login(username, password);
       if (user) {
         location.href = "app.html";
         return;
@@ -52,9 +52,7 @@ if (loginForm) {
       errBox.textContent = "Invalid username or password.";
     } catch (err) {
       console.error(err);
-      errBox.textContent = DB.mode === "supabase"
-        ? "Could not reach the database. Check your connection and try again."
-        : "Failed to load local data.";
+      errBox.textContent = "Could not reach the server. Check your connection and try again.";
     }
 
     submitBtn.disabled = false;

@@ -7,3 +7,7 @@ Desktop.ini
 # Logs & temp
 *.log
 tmp/
+
+# Secrets & deps
+.env
+node_modules/

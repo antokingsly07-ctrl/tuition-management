@@ -1,0 +1,8 @@
+{
+  "name": "tuition-management",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "mongodb": "^6.9.0"
+  }
+}

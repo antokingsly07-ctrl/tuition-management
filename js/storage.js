@@ -1,21 +1,15 @@
 /* ============================================================
-   Data layer — Supabase (remote) with localStorage fallback
-   1. Create a project at https://supabase.com
-   2. Run supabase-schema.sql in the SQL Editor
-   3. Paste your Project URL + anon key below (Settings → API)
-   Until keys are pasted, the app runs in local-only mode.
+   Data layer — MongoDB Atlas via Vercel serverless API (/api)
+   Falls back to localStorage automatically when the backend
+   isn't configured (no MONGODB_URI) or unreachable.
+   Reads are served from an in-memory cache; writes update the
+   cache immediately (optimistic) then sync to the server.
    ============================================================ */
-
-const SUPABASE_URL = "";      // e.g. "https://abcdefgh.supabase.co"
-const SUPABASE_ANON_KEY = ""; // e.g. "eyJhbGciOi..."
 
 const DB = (() => {
   const LOCAL_KEY = "tuition_manager_v2";
-  let mem = null; // in-memory cache shaped like the old DB object
-
-  const client = (window.supabase && SUPABASE_URL && SUPABASE_ANON_KEY)
-    ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
-    : null;
+  let mem = null;
+  let remote = false;
 
   /* UI hook: set from app.js to show error toasts */
   let onWriteError = null;
@@ -27,9 +21,9 @@ const DB = (() => {
   function seed() {
     return {
       users: [
-        { id: uid("u_"), username: "admin", password: "admin123", name: "Admin", role: "admin" },
-        { id: uid("u_"), username: "tuition", password: "teach123", name: "Tuition Teacher", role: "teacher", section: "tuition" },
-        { id: uid("u_"), username: "typewriting", password: "teach123", name: "Typewriting Teacher", role: "teacher", section: "typewriting" }
+        { id: "u_admin", username: "admin", password: "admin123", name: "Admin", role: "admin", section: null },
+        { id: "u_tuition", username: "tuition", password: "teach123", name: "Tuition Teacher", role: "teacher", section: "tuition" },
+        { id: "u_typewriting", username: "typewriting", password: "teach123", name: "Typewriting Teacher", role: "teacher", section: "typewriting" }
       ],
       students: [
         { id: uid("s_"), name: "Aarav Kumar", phone: "9876500001", section: "tuition", batch: "Morning", joinDate: "2026-06-01", monthlyFee: 800, active: true },
@@ -43,50 +37,63 @@ const DB = (() => {
     };
   }
 
-  /* ---------- init: load everything into memory ---------- */
+  function persistLocal() {
+    if (!remote) localStorage.setItem(LOCAL_KEY, JSON.stringify(mem));
+  }
+
+  async function api(path, opts) {
+    const res = await fetch("/api/" + path, {
+      headers: { "Content-Type": "application/json" },
+      ...opts
+    });
+    if (!res.ok) throw new Error(`${path} -> HTTP ${res.status}`);
+    return res.status === 204 ? null : res.json();
+  }
+
+  /* ---------- init ---------- */
   async function init() {
-    if (!client) {
+    try {
+      const d = await api("bootstrap");
+      mem = {
+        users: d.users || [],
+        students: d.students || [],
+        payments: d.payments || [],
+        attendance: d.attendance || []
+      };
+      remote = true;
+      return "mongodb";
+    } catch (err) {
+      console.warn("[DB] backend unavailable, using localStorage:", err.message);
+      remote = false;
       const raw = localStorage.getItem(LOCAL_KEY);
       mem = raw ? JSON.parse(raw) : seed();
       persistLocal();
       return "local";
     }
-
-    const [u, s, p, a] = await Promise.all([
-      client.from("users").select("*"),
-      client.from("students").select("*"),
-      client.from("payments").select("*"),
-      client.from("attendance").select("*")
-    ]);
-    for (const r of [u, s, p, a]) if (r.error) throw r.error;
-
-    mem = { users: u.data, students: s.data, payments: p.data, attendance: a.data };
-
-    // first run against an empty project → push seed data
-    if (!mem.users.length && !mem.students.length) {
-      const seeded = seed();
-      const ins = await Promise.all([
-        client.from("users").insert(seeded.users),
-        client.from("students").insert(seeded.students)
-      ]);
-      for (const r of ins) if (r.error) throw r.error;
-      mem.users = seeded.users;
-      mem.students = seeded.students;
-    }
-    return "supabase";
   }
 
-  /* ---------- sync reads (app.js uses these everywhere) ---------- */
+  /* ---------- sync read (app.js uses this everywhere) ---------- */
   function load() {
-    return mem || seed(); // safe fallback pre-init
-  }
-
-  function persistLocal() {
-    localStorage.setItem(LOCAL_KEY, JSON.stringify(mem));
+    return mem || seed();
   }
 
   function uid(prefix = "") {
     return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  }
+
+  /* ---------- auth ---------- */
+  async function authenticate(username, password) {
+    if (remote) {
+      return api("login", {
+        method: "POST",
+        body: JSON.stringify({ username, password })
+      });
+    }
+    // local fallback
+    const user = mem.users.find(u => u.username === username && u.password === password);
+    if (!user) return null;
+    const { password: _pw, ...safe } = user;
+    return safe;
   }
 
   /* ---------- granular writes ---------- */
@@ -94,9 +101,9 @@ const DB = (() => {
     student.id = student.id || uid("s_");
     mem.students.push(student);
     persistLocal();
-    if (client) {
-      const { error } = await client.from("students").insert(student);
-      if (error) fail("addStudent", error);
+    if (remote) {
+      try { Object.assign(student, await api("students", { method: "POST", body: JSON.stringify(student) })); }
+      catch (err) { fail("addStudent", err); }
     }
     return student;
   }
@@ -105,9 +112,9 @@ const DB = (() => {
     const s = mem.students.find(x => x.id === id);
     if (s) Object.assign(s, patch);
     persistLocal();
-    if (client) {
-      const { error } = await client.from("students").update(patch).eq("id", id);
-      if (error) fail("updateStudent", error);
+    if (remote) {
+      try { await api("students/" + encodeURIComponent(id), { method: "PUT", body: JSON.stringify(patch) }); }
+      catch (err) { fail("updateStudent", err); }
     }
   }
 
@@ -116,14 +123,9 @@ const DB = (() => {
     mem.payments = mem.payments.filter(p => p.studentId !== id);
     mem.attendance.forEach(a => delete a.records[id]);
     persistLocal();
-    if (client) {
-      const { error } = await client.from("students").delete().eq("id", id); // payments cascade
-      if (error) return fail("deleteStudent", error);
-      for (const a of mem.attendance) {
-        const { error: aErr } = await client
-          .from("attendance").update({ records: a.records }).eq("id", a.id);
-        if (aErr) return fail("deleteStudent.attendance", aErr);
-      }
+    if (remote) {
+      try { await api("students/" + encodeURIComponent(id), { method: "DELETE" }); }
+      catch (err) { fail("deleteStudent", err); }
     }
   }
 
@@ -131,9 +133,9 @@ const DB = (() => {
     payment.id = payment.id || uid("p_");
     mem.payments.push(payment);
     persistLocal();
-    if (client) {
-      const { error } = await client.from("payments").insert(payment);
-      if (error) fail("addPayment", error);
+    if (remote) {
+      try { Object.assign(payment, await api("payments", { method: "POST", body: JSON.stringify(payment) })); }
+      catch (err) { fail("addPayment", err); }
     }
     return payment;
   }
@@ -141,35 +143,29 @@ const DB = (() => {
   async function deletePayment(id) {
     mem.payments = mem.payments.filter(p => p.id !== id);
     persistLocal();
-    if (client) {
-      const { error } = await client.from("payments").delete().eq("id", id);
-      if (error) fail("deletePayment", error);
+    if (remote) {
+      try { await api("payments/" + encodeURIComponent(id), { method: "DELETE" }); }
+      catch (err) { fail("deletePayment", err); }
     }
   }
 
   async function saveAttendance(date, section, records) {
     const existing = mem.attendance.find(a => a.date === date && a.section === section);
-    if (existing) {
-      existing.records = records;
-      persistLocal();
-      if (client) {
-        const { error } = await client.from("attendance").update({ records }).eq("id", existing.id);
-        if (error) fail("saveAttendance", error);
-      }
-    } else {
-      const row = { id: uid("a_"), date, section, records };
-      mem.attendance.push(row);
-      persistLocal();
-      if (client) {
-        const { error } = await client.from("attendance").insert(row);
-        if (error) fail("saveAttendance", error);
-      }
+    if (existing) existing.records = records;
+    else mem.attendance.push({ id: uid("a_"), date, section, records });
+    persistLocal();
+    if (remote) {
+      try {
+        const saved = await api("attendance", { method: "POST", body: JSON.stringify({ date, section, records }) });
+        const row = mem.attendance.find(a => a.date === date && a.section === section);
+        if (row && saved?.id) row.id = saved.id;
+      } catch (err) { fail("saveAttendance", err); }
     }
   }
 
   return {
-    get mode() { return client ? "supabase" : "local"; },
-    init, load,
+    get mode() { return remote ? "mongodb" : "local"; },
+    init, load, authenticate,
     addStudent, updateStudent, deleteStudent,
     addPayment, deletePayment,
     saveAttendance,
