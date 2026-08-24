@@ -11,8 +11,9 @@ async function getDb() {
     cachedClient = new MongoClient(uri);
     await cachedClient.connect();
   }
-  // db name taken from the URI path, fallback "tuition"
-  return cachedClient.db();
+  // use the db name from the URI path if present, otherwise "tuition"
+  const match = uri.match(/mongodb(?:\+srv)?:\/\/[^/]+\/([a-zA-Z0-9_-]+)(?:\?|$)/);
+  return cachedClient.db(match ? match[1] : "tuition");
 }
 
 function seedData() {
