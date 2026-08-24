@@ -281,13 +281,20 @@ window.openStudentForm = function (id = null) {
       joinDate: f.get("joinDate"),
       active: f.get("active") === "true"
     };
-    if (s) {
-      await DB.updateStudent(s.id, patch);
-    } else {
-      await DB.addStudent({ ...patch, section: state.section });
+    if (!patch.name) { toast("Name is required", "error"); return; }
+    try {
+      if (s) {
+        await DB.updateStudent(s.id, patch);
+      } else {
+        await DB.addStudent({ ...patch, section: state.section });
+      }
+      closeModal();
+      toast(s ? "Student updated" : "Student added to database");
+    } catch (err) {
+      console.error(err);
+      toast("Could not save: " + (err.message || err), "error");
+      return;
     }
-    closeModal();
-    toast(s ? "Student updated" : "Student added");
     render();
   });
 };
