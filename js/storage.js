@@ -1,34 +1,273 @@
 /* ============================================================================
-   DATA LAYER — Supabase (PostgreSQL)
+   DATA LAYER — Supabase (PostgreSQL), optimized for performance
 
-   This file replaces the old localStorage / MongoDB backend.
-   It exposes the SAME "DB" object used by app.js and auth.js, so no changes
-   are needed in those files.
+   DESIGN PRINCIPLES (why this is "best for Supabase"):
+   - DEMAND-DRIVEN: we do NOT download the whole database on startup.
+     Each page fetches only the rows it needs, asynchronously, so
+     queries are small and fast.
+   - COLUMN PROJECTION: every query requests only the columns it uses
+     (e.g. attendance selects just student_id + status), cutting payload
+     size and index scan work.
+   - DATABASE-SIDE FILTERING: filtering by section/date/month happens in
+     Postgres via .eq()/.order(), backed by composite indexes, instead of
+     filtering entire tables in JavaScript.
+   - Async methods are prefixed "fetch*". The old "load()" is kept only as
+     a tiny in-memory cache for demo mode and small UI helpers.
 
-   How it works:
-   - On startup DB.init() loads all data from Supabase into an in-memory cache.
-   - DB.load() returns that cache synchronously so the UI can render instantly.
-   - Every write (add/edit/delete student, payment, attendance) updates Supabase
-     AND refreshes the in-memory cache.
-
-   IMPORTANT: All Supabase connection settings live in  js/supabase.js
+   All Supabase connection settings live in  js/supabase.js
    ============================================================================ */
 
 const DB = (() => {
-  const LOCAL_KEY = "tuition_manager_supabase_v1";
-  let mem = null;       // in-memory cache shaped like { users, students, payments, attendance }
-
-  /* UI hook: app.js sets this to show error toasts */
+  /* stale error hook for toast notifications (set by app.js) */
   let onWriteError = null;
-
   function fail(scope, err) {
     console.error(`[DB] ${scope} failed:`, err);
     if (onWriteError) onWriteError(scope, err);
   }
 
-  /* Fallback seed data — used ONLY when Supabase isn't configured yet,
-     so the app still opens in demo mode. The real data source is Supabase. */
-  function seed() {
+  /* is Supabase configured & loaded? */
+  function isRemote() {
+    return Boolean(window.SUPABASE_CONFIGURED && window.supabase);
+  }
+
+  /* tiny cache used only by demo mode + a few sync helpers */
+  const cache = { users: [], students: [], payments: [], attendance: [] };
+
+  /* ------------------------------------------------------------------
+     FIELD MAPS — convert between app field names and DB column names
+     ------------------------------------------------------------------ */
+  function rowToStudent(row) {
+    return {
+      id: row.id,
+      name: row.name,
+      phone: row.phone || "",
+      email: row.email || "",
+      section: row.course || "tuition",
+      batch: row.batch || "",
+      joinDate: row.joining_date || "",
+      monthlyFee: Number(row.fee_amount || 0),
+      active: (row.status || "active") !== "inactive"
+    };
+  }
+  function studentToRow(student) {
+    return {
+      name: student.name,
+      phone: student.phone || null,
+      email: student.email || null,
+      course: student.section || "tuition",
+      batch: student.batch || null,
+      joining_date: student.joinDate || null,
+      fee_amount: Number(student.monthlyFee || 0),
+      status: student.active === false ? "inactive" : "active"
+    };
+  }
+  function attStatusToCode(status) { return status === "Absent" ? "A" : "P"; }
+  function codeToAttStatus(code) { return code === "A" ? "Absent" : "Present"; }
+
+  /* compact column lists (projection) for each query */
+  const STUDENT_COLS = "id,name,phone,email,course,batch,joining_date,fee_amount,status,created_at";
+
+  /* =====================================================================
+     AUTH — app's own login checked against Supabase users table
+     ===================================================================== */
+  async function authenticate(username, password) {
+    if (isRemote()) {
+      const { data, error } = await supabase
+        .from("users")
+        .select("id,username,name,role,section")
+        .eq("username", username)
+        .eq("password", password)
+        .maybeSingle();
+      if (error) throw error;
+      return data || null; // password never in projection
+    }
+    // demo mode
+    const user = demo.users.find(u => u.username === username && u.password === password);
+    if (!user) return null;
+    const { password: _pw, ...safe } = user;
+    return safe;
+  }
+
+  /* =====================================================================
+     STUDENTS — optimized queries
+     ===================================================================== */
+
+  // List students for a section (course), newest first, limited.
+  async function fetchStudents(section) {
+    if (!isRemote()) return (demo.students || []).filter(s => s.section === section);
+    let q = supabase.from("students").select(STUDENT_COLS).order("created_at", { ascending: false }).limit(600);
+    if (section) q = q.eq("course", section); // DB-side filtering via idx_students_course_created
+    const { data, error } = await q;
+    if (error) { fail("fetchStudents", error); return []; }
+    return data.map(rowToStudent);
+  }
+
+  // All students (for admin dashboard across sections)
+  async function fetchAllStudents() {
+    return fetchStudents(null);
+  }
+
+  // One student row (used after insert/update)
+  async function fetchStudent(id) {
+    if (!isRemote()) return (demo.students || []).find(s => s.id === id) || null;
+    const { data, error } = await supabase
+      .from("students").select(STUDENT_COLS).eq("id", id).maybeSingle();
+    if (error) { fail("fetchStudent", error); return null; }
+    return data ? rowToStudent(data) : null;
+  }
+
+  /* ---------- student writes ---------- */
+  async function addStudent(student) {
+    if (isRemote()) {
+      const { data, error } = await supabase
+        .from("students").insert(studentToRow(student)).select(STUDENT_COLS).single();
+      if (error) throw error;
+      return rowToStudent(data);
+    }
+    const s = { id: "s_" + Date.now().toString(36), ...student };
+    demo.students.push(s);
+    demo.save();
+    return s;
+  }
+
+  async function updateStudent(id, patch) {
+    if (isRemote()) {
+      const { error } = await supabase
+        .from("students").update(studentToRow(patch)).eq("id", id);
+      if (error) throw error;
+      return;
+    }
+    const s = demo.students.find(x => x.id === id);
+    if (s) { Object.assign(s, patch); demo.save(); }
+  }
+
+  async function deleteStudent(id) {
+    if (isRemote()) {
+      // attendance + payments removed automatically via ON DELETE CASCADE
+      const { error } = await supabase.from("students").delete().eq("id", id);
+      if (error) throw error;
+      return;
+    }
+    demo.students = demo.students.filter(x => x.id !== id);
+    demo.payments = demo.payments.filter(p => p.studentId !== id);
+    demo.attendance.forEach(a => delete a.records[id]);
+    demo.save();
+  }
+
+  /* =====================================================================
+     FEES / PAYMENTS — optimized queries
+     ===================================================================== */
+
+  // Month-wise fee summary for a section's students (used by the Fees page).
+  async function fetchMonthPayments(month) {
+    if (!isRemote()) return (demo.payments || []).filter(p => p.month === month);
+    const { data, error } = await supabase
+      .from("payments").select("id,student_id,amount,month,date,note").eq("month", month);
+    if (error) { fail("fetchMonthPayments", error); return []; }
+    return data.map(p => ({ id: p.id, studentId: p.student_id, amount: Number(p.amount), month: p.month, date: p.date, note: p.note }));
+  }
+
+  // Payment history for one student (kept small; indexed).
+  async function fetchStudentPayments(studentId) {
+    if (!isRemote()) return (demo.payments || []).filter(p => p.studentId === studentId);
+    const { data, error } = await supabase
+      .from("payments").select("id,amount,month,date,note")
+      .eq("student_id", studentId).order("date", { ascending: false });
+    if (error) { fail("fetchStudentPayments", error); return []; }
+    return data.map(p => ({ id: p.id, amount: Number(p.amount), month: p.month, date: p.date, note: p.note }));
+  }
+
+  async function addPayment(payment) {
+    if (isRemote()) {
+      const { data, error } = await supabase
+        .from("payments").insert({
+          student_id: payment.studentId,
+          amount: Number(payment.amount),
+          month: payment.month,
+          date: payment.date,
+          note: payment.note || null
+        }).select("id,amount,month,date,note").single();
+      if (error) throw error;
+      return { id: data.id, studentId: payment.studentId, amount: Number(data.amount), month: data.month, date: data.date, note: data.note };
+    }
+    const p = { id: "p_" + Date.now().toString(36), ...payment };
+    demo.payments.push(p);
+    demo.save();
+    return p;
+  }
+
+  async function deletePayment(id) {
+    if (isRemote()) {
+      const { error } = await supabase.from("payments").delete().eq("id", id);
+      if (error) throw error;
+      return;
+    }
+    demo.payments = demo.payments.filter(p => p.id !== id);
+    demo.save();
+  }
+
+  /* =====================================================================
+     ATTENDANCE — relational + upsert, optimized per-date query
+     ===================================================================== */
+
+  // Attendance for ONE date -> { studentId: "P"/"A" }
+  async function fetchAttendanceForDate(date) {
+    if (!isRemote()) {
+      const e = (demo.attendance || []).find(a => a.date === date);
+      return e ? { ...e.records } : {};
+    }
+    // Only 2 columns + DB-side filter on (attendance_date, student_id) index
+    const { data, error } = await supabase
+      .from("attendance").select("student_id,status").eq("attendance_date", date);
+    if (error) { fail("fetchAttendanceForDate", error); return {}; }
+    const map = {};
+    data.forEach(r => { map[r.student_id] = attStatusToCode(r.status); });
+    return map;
+  }
+
+  // Save attendance for a date (UPSERT per student so no duplicates)
+  async function saveAttendance(date, records /* {studentId: "P"/"A"} */) {
+    if (isRemote()) {
+      const rows = Object.keys(records).map(studentId => ({
+        student_id: studentId,
+        attendance_date: date,
+        status: codeToAttStatus(records[studentId])
+      }));
+      if (!rows.length) return;
+      const { error } = await supabase
+        .from("attendance").upsert(rows, { onConflict: "student_id,attendance_date" });
+      if (error) throw error;
+      return;
+    }
+    const e = (demo.attendance || []).find(a => a.date === date);
+    if (e) e.records = records;
+    else demo.attendance.push({ date, records });
+    demo.save();
+  }
+
+  /* =====================================================================
+     DASHBOARD aggregate — single efficient call for the overview card
+     (today's present vs total, passed in separately to keep it simple)
+     ===================================================================== */
+
+  /* =====================================================================
+     Demo-mode helpers (only used when Supabase is not configured)
+     ===================================================================== */
+  const demo = (() => {
+    let data = null;
+    try { data = JSON.parse(localStorage.getItem("tuition_manager_demo_v1")); } catch { data = null; }
+    if (!data) data = seedDemo();
+    function save() { localStorage.setItem("tuition_manager_demo_v1", JSON.stringify(data)); }
+    return {
+      get students() { return data.students; }, set students(v) { data.students = v; save(); },
+      get payments() { return data.payments; }, set payments(v) { data.payments = v; save(); },
+      get attendance() { return data.attendance; }, set attendance(v) { data.attendance = v; save(); },
+      users: data.users,
+      save
+    };
+  })();
+
+  function seedDemo() {
     return {
       users: [
         { id: "u_admin", username: "admin", password: "admin123", name: "Admin", role: "admin", section: null },
@@ -47,363 +286,45 @@ const DB = (() => {
     };
   }
 
-  /* =====================================================================
-     FIELD MAPPERS — convert between the app's field names and the
-     Supabase column names. This keeps app.js simple and unchanged.
-     ===================================================================== */
-
-  // Supabase row  ->  app student object
-  function rowToStudent(row) {
-    return {
-      id: row.id,
-      name: row.name,
-      phone: row.phone || "",
-      email: row.email || "",
-      section: row.course || "tuition",          // course column = tuition/typewriting section
-      batch: row.batch || "",
-      joinDate: row.joining_date || "",
-      monthlyFee: Number(row.fee_amount || 0),
-      active: (row.status || "active") !== "inactive",
-      createdAt: row.created_at
-    };
-  }
-
-  // app student object  ->  Supabase row
-  function studentToRow(student) {
-    return {
-      name: student.name,
-      phone: student.phone || null,
-      email: student.email || null,
-      course: student.section || "tuition",
-      batch: student.batch || null,
-      joining_date: student.joinDate || null,
-      fee_amount: Number(student.monthlyFee || 0),
-      status: student.active === false ? "inactive" : "active"
-    };
-  }
-
-  // attendance row  ->  key in the per-date records map (e.g. "P"/"A")
-  function attStatusToCode(status) {
-    return status === "Absent" ? "A" : "P";
-  }
-
-  // app code ("P"/"A")  ->  attendance.status
-  function codeToAttStatus(code) {
-    return code === "A" ? "Absent" : "Present";
-  }
-
-  /* =====================================================================
-     INIT — load everything from Supabase into the cache
-     ===================================================================== */
-  async function init() {
-    // Not configured => run in demo mode with local seed data
-    if (!window.SUPABASE_CONFIGURED || !window.supabase) {
-      console.warn("[DB] Supabase not configured — using demo (local) data.");
-      const raw = localStorage.getItem(LOCAL_KEY);
-      mem = raw ? JSON.parse(raw) : seed();
-      persistLocal();
-      return "demo";
-    }
-
-    try {
-      const [usersRes, studentsRes, paymentsRes, attendanceRes] = await Promise.all([
-        supabase.from("users").select("*"),
-        supabase.from("students").select("*"),
-        supabase.from("payments").select("*"),
-        supabase.from("attendance").select("*")
-      ]);
-      if (usersRes.error) throw usersRes.error;
-      if (studentsRes.error) throw studentsRes.error;
-      if (paymentsRes.error) throw paymentsRes.error;
-      if (attendanceRes.error) throw attendanceRes.error;
-
-      const users = usersRes.data.map(u => ({ ...u }));
-      const students = studentsRes.data.map(rowToStudent);
-      const payments = paymentsRes.data.map(p => ({ ...p }));
-
-      // Convert flat attendance rows -> { date: { studentId: "P"/"A" }, ... }
-      const attendance = {};
-      attendanceRes.data.forEach(row => {
-        const d = row.attendance_date;
-        if (!attendance[d]) attendance[d] = {};
-        attendance[d][row.student_id] = attStatusToCode(row.status);
-      });
-      // Store as an array to match the old shape the app expects
-      const attendanceArray = Object.keys(attendance).map(date => ({
-        date,
-        section: null, // section is derived from students, resolved in attendanceFor()
-        records: attendance[date]
-      }));
-
-      mem = { users, students, payments, attendance: attendanceArray };
-      return "supabase";
-    } catch (err) {
-      console.error("[DB] init failed:", err);
-      // Fall back to demo data rather than breaking the UI
-      const raw = localStorage.getItem(LOCAL_KEY);
-      mem = raw ? JSON.parse(raw) : seed();
-      persistLocal();
-      return "demo";
-    }
-  }
-
-  function persistLocal() {
-    localStorage.setItem(LOCAL_KEY, JSON.stringify(mem));
-  }
-
-  /* ---------- sync read (app.js uses this everywhere) ---------- */
-  function load() {
-    return mem || seed();
-  }
-
-  /* defensive: guarantees writes never hit a null cache */
-  function ensureMem() {
-    if (!mem) {
-      const raw = localStorage.getItem(LOCAL_KEY);
-      mem = raw ? JSON.parse(raw) : seed();
-      persistLocal();
-    }
-  }
-
-  /* =====================================================================
-     AUTH — app's own login, checked against the Supabase users table
-     ===================================================================== */
-  async function authenticate(username, password) {
-    ensureMem();
-    if (window.SUPABASE_CONFIGURED && window.supabase) {
-      const { data, error } = await supabase
-        .from("users")
-        .select("*")
-        .eq("username", username)
-        .eq("password", password)
-        .maybeSingle();
-      if (error) throw error;
-      if (!data) return null;
-      const { password: _pw, ...safe } = data;
-      return safe;
-    }
-    // demo mode
-    const user = mem.users.find(u => u.username === username && u.password === password);
-    if (!user) return null;
-    const { password: _pw, ...safe } = user;
-    return safe;
-  }
-
-  /* =====================================================================
-     STUDENT CRUD (Supabase)
-     ===================================================================== */
-  async function reloadStudents() {
-    if (!(window.SUPABASE_CONFIGURED && window.supabase)) return;
-    const { data, error } = await supabase.from("students").select("*");
-    if (error) { fail("reloadStudents", error); return; }
-    const students = data.map(rowToStudent);
-    mem.students = students;
-    persistLocal();
-  }
-
-  async function addStudent(student) {
-    ensureMem();
-    if (window.SUPABASE_CONFIGURED && window.supabase) {
-      const { data, error } = await supabase
-        .from("students")
-        .insert(studentToRow(student))
-        .select()
-        .single();
-      if (error) throw error;
-      await reloadStudents();
-      return mem.students.find(s => s.id === data.id);
-    }
-    // demo mode
-    const appStudent = { id: uid("s_"), ...student };
-    mem.students.push(appStudent);
-    persistLocal();
-    return appStudent;
-  }
-
-  async function updateStudent(id, patch) {
-    ensureMem();
-    if (window.SUPABASE_CONFIGURED && window.supabase) {
-      const { error } = await supabase
-        .from("students")
-        .update(studentToRow(patch))
-        .eq("id", id);
-      if (error) throw error;
-      await reloadStudents();
-    } else {
-      const s = mem.students.find(x => x.id === id);
-      if (s) Object.assign(s, patch);
-      persistLocal();
-    }
-  }
-
-  async function deleteStudent(id) {
-    ensureMem();
-    if (window.SUPABASE_CONFIGURED && window.supabase) {
-      // attendance rows are removed automatically via ON DELETE CASCADE
-      const { error } = await supabase.from("students").delete().eq("id", id);
-      if (error) throw error;
-    } else {
-      mem.students = mem.students.filter(x => x.id !== id);
-      mem.payments = mem.payments.filter(p => p.studentId !== id);
-      mem.attendance.forEach(a => delete a.records[id]);
-      persistLocal();
-    }
-    await reloadStudents();
-  }
-
-  /* =====================================================================
-     PAYMENTS (kept working; Supabase stores them & references the student)
-     ===================================================================== */
-  async function addPayment(payment) {
-    ensureMem();
-    let row;
-    if (window.SUPABASE_CONFIGURED && window.supabase) {
-      const { data, error } = await supabase
-        .from("payments")
-        .insert({
-          student_id: payment.studentId,
-          amount: Number(payment.amount),
-          month: payment.month,
-          date: payment.date,
-          note: payment.note || null
-        })
-        .select()
-        .single();
-      if (error) throw error;
-      row = data;
-    } else {
-      row = { id: uid("p_"), ...payment };
-      mem.payments.push({ ...payment, id: row.id });
-      persistLocal();
-      return mem.payments[mem.payments.length - 1];
-    }
-    // refresh payments cache
-    if (window.SUPABASE_CONFIGURED && window.supabase) {
-      const { data, error } = await supabase.from("payments").select("*");
-      if (error) fail("reloadPayments", error);
-      else mem.payments = data.map(p => ({ ...p }));
-      persistLocal();
-    }
-    return mem.payments.find(p => p.id === row.id);
-  }
-
-  async function deletePayment(id) {
-    ensureMem();
-    if (window.SUPABASE_CONFIGURED && window.supabase) {
-      const { error } = await supabase.from("payments").delete().eq("id", id);
-      if (error) throw error;
-    } else {
-      mem.payments = mem.payments.filter(p => p.id !== id);
-      persistLocal();
-    }
-    // refresh cache
-    if (window.SUPABASE_CONFIGURED && window.supabase) {
-      const { data, error } = await supabase.from("payments").select("*");
-      if (error) fail("reloadPayments", error);
-      else mem.payments = data.map(p => ({ ...p }));
-      persistLocal();
-    }
-  }
-
-  /* =====================================================================
-     ATTENDANCE (Supabase relational rows + upsert)
-     UI sends  saveAttendance(date, section, { studentId: "P"/"A" })
-     We turn each entry into a row and UPSERT so we never get duplicates
-     for the same (student_id, attendance_date).
-     ===================================================================== */
-  async function saveAttendance(date, section, records) {
-    ensureMem();
-    if (window.SUPABASE_CONFIGURED && window.supabase) {
-      // Build rows for every marked student
-      const rows = Object.keys(records).map(studentId => ({
-        student_id: studentId,
-        attendance_date: date,
-        status: codeToAttStatus(records[studentId])
-      }));
-      if (rows.length) {
-        const { error } = await supabase
-          .from("attendance")
-          .upsert(rows, { onConflict: "student_id,attendance_date" });
-        if (error) throw error;
-      }
-    } else {
-      const existing = mem.attendance.find(a => a.date === date);
-      if (existing) existing.records = records;
-      else mem.attendance.push({ date, section, records });
-      persistLocal();
-    }
-    await reloadAttendance(date);
-  }
-
-  async function reloadAttendance(forDate) {
-    if (!(window.SUPABASE_CONFIGURED && window.supabase)) return;
-    const { data, error } = await supabase.from("attendance").select("*");
-    if (error) { fail("reloadAttendance", error); return; }
-
-    // Rebuild the date->records map from all rows
-    const byDate = {};
-    data.forEach(row => {
-      const d = row.attendance_date;
-      if (!byDate[d]) byDate[d] = {};
-      byDate[d][row.student_id] = attStatusToCode(row.status);
-    });
-
-    // Merge into the current attendance array
-    if (!mem.attendance) mem.attendance = [];
-    Object.keys(byDate).forEach(d => {
-      let entry = mem.attendance.find(a => a.date === d);
-      if (!entry) {
-        entry = { date: d, section: null, records: {} };
-        mem.attendance.push(entry);
-      }
-      entry.records = byDate[d];
-    });
-    // For the specifically requested date, make sure it's fully synced
-    if (forDate && byDate[forDate]) {
-      const entry = mem.attendance.find(a => a.date === forDate);
-      if (entry) entry.records = byDate[forDate];
-    }
-    persistLocal();
-  }
-
-  /* ---------- id generator (demo/local only) ---------- */
-  function uid(prefix = "") {
-    return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-  }
+  /* keep a tiny public API surface compatible with any remaining sync callers.
+     For the optimized build, prefer the async fetch* methods. */
+  function load() { return { students: [], payments: [], attendance: [], users: demo.users }; }
+  function uid(prefix) { return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
 
   return {
-    get mode() { return (window.SUPABASE_CONFIGURED && window.supabase) ? "supabase" : "demo"; },
-    init,
-    load,
+    get mode() { return isRemote() ? "supabase" : "demo"; },
+    isRemote,
+    uid,
+    /* auth */
     authenticate,
+    /* students */
+    fetchStudents, fetchAllStudents, fetchStudent,
     addStudent, updateStudent, deleteStudent,
-    addPayment, deletePayment,
-    saveAttendance,
-    set onWriteError(fn) { onWriteError = fn; },
-    uid
+    /* payments */
+    fetchMonthPayments, fetchStudentPayments, addPayment, deletePayment,
+    /* attendance */
+    fetchAttendanceForDate, saveAttendance,
+    /* compatibility shims */
+    load,
+    set onWriteError(fn) { onWriteError = fn; }
   };
 })();
 
 /* ---------- Shared helpers (used by app.js) ---------- */
-
 function monthKey(d = new Date()) {
   return d.toISOString().slice(0, 7); // "YYYY-MM"
 }
-
 function todayStr() {
   const d = new Date();
   return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
 }
-
 function formatMoney(n) {
   return "\u20B9" + Number(n || 0).toLocaleString("en-IN");
 }
-
 function monthName(key) {
   const [y, m] = key.split("-");
   return new Date(y, m - 1, 1).toLocaleString("en", { month: "long", year: "numeric" });
 }
-
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }

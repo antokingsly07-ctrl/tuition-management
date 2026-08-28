@@ -6,7 +6,6 @@ const Auth = {
     return raw ? JSON.parse(raw) : null;
   },
 
-  /* call only after DB.init() has resolved */
   async login(username, password) {
     const user = await DB.authenticate(username, password);
     if (!user) return null;
@@ -43,7 +42,6 @@ if (loginForm) {
     submitBtn.textContent = "Signing in…";
 
     try {
-      await DB.init();
       const user = await Auth.login(username, password);
       if (user) {
         location.href = "app.html";

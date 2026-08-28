@@ -1,4 +1,7 @@
-/* ---------- App state & router ---------- */
+/* ---------- App state & router ----------
+   Data is loaded on demand from Supabase (see js/storage.js) so each page
+   queries only what it needs. Render functions are async and show a small
+   loading state while the (fast, indexed) query runs. */
 
 const session = Auth.require();
 const isAdmin = session.role === "admin";
@@ -71,27 +74,10 @@ function toast(msg, type = "success") {
   setTimeout(() => t.classList.add("hidden"), 2600);
 }
 
-/* ----- data helpers scoped to current section ----- */
-function studentsOf(section = state.section) {
-  return DB.load().students.filter(s => s.section === section);
-}
-function studentById(id) {
-  return DB.load().students.find(s => s.id === id);
-}
-function paidFor(studentId, month) {
-  return DB.load().payments
-    .filter(p => p.studentId === studentId && p.month === month)
-    .reduce((sum, p) => sum + Number(p.amount), 0);
-}
-function attendanceFor(date, section = state.section) {
-  // attendance is stored per date; students already carry their section
-  return DB.load().attendance.find(a => a.date === date);
-}
-
 /* =========================================================
-   RENDER DISPATCH
+   RENDER DISPATCH (async — each page loads its own data)
 ========================================================= */
-function render() {
+async function render() {
   const titles = {
     tuition: { dashboard: "Tuition Dashboard", students: "Tuition Students", fees: "Tuition Fees", attendance: "Tuition Attendance" },
     typewriting: { dashboard: "Typewriting Dashboard", students: "Typewriting Students", fees: "Typewriting Fees", attendance: "Typewriting Attendance" }
@@ -109,113 +95,127 @@ function render() {
       <div><h2>${t}</h2><p>${sub}</p></div>
       <div id="page-actions"></div>
     </div>
-    <div id="page-body"></div>
+    <div id="page-body"><div class="empty-state">Loading…</div></div>
   `;
 
-  ({ dashboard: renderDashboard, students: renderStudents, fees: renderFees, attendance: renderAttendance })[state.page]();
+  const dispatcher = {
+    dashboard: renderDashboard,
+    students: renderStudents,
+    fees: renderFees,
+    attendance: renderAttendance
+  }[state.page];
+  await dispatcher();
 }
 
 /* =========================================================
    DASHBOARD
 ========================================================= */
-function renderDashboard() {
-  const db = DB.load();
+async function renderDashboard() {
   const month = monthKey();
-  const studs = studentsOf();
-  const active = studs.filter(s => s.active);
+  const body = document.getElementById("page-body");
+  body.innerHTML = `<div class="empty-state">Loading…</div>`;
 
-  const expected = active.reduce((sum, s) => sum + Number(s.monthlyFee), 0);
-  const collected = db.payments
-    .filter(p => p.month === month && studentById(p.studentId)?.section === state.section)
-    .reduce((sum, p) => sum + Number(p.amount), 0);
-  const pending = Math.max(expected - collected, 0);
+  try {
+    // Fetch the pieces needed for the dashboard cards in parallel.
+    const [studs, monthPayments] = await Promise.all([
+      DB.fetchStudents(state.section),
+      DB.fetchMonthPayments(month)
+    ]);
 
-  const attToday = attendanceFor(todayStr());
-  let attSub = "Not marked yet";
-  let attBadge = `<span class="badge gray">—</span>`;
-  if (attToday) {
-    const vals = Object.values(attToday.records);
-    const present = vals.filter(v => v === "P").length;
-    const pct = vals.length ? Math.round(present / vals.length * 100) : 0;
-    attSub = `${present}/${vals.length} present`;
-    attBadge = `<span class="badge ${pct >= 75 ? "green" : "amber"}">${pct}%</span>`;
+    const active = studs.filter(s => s.active);
+    const expected = active.reduce((sum, s) => sum + Number(s.monthlyFee), 0);
+    const collected = monthPayments
+      .filter(p => studs.some(s => s.id === p.studentId))
+      .reduce((sum, p) => sum + Number(p.amount), 0);
+    const pending = Math.max(expected - collected, 0);
+    const studById = new Map(studs.map(s => [s.id, s]));
+
+    let attSub = "Not marked yet";
+    let attBadge = `<span class="badge gray">—</span>`;
+    const attToday = await DB.fetchAttendanceForDate(todayStr());
+    const presentKeys = Object.keys(attToday).filter(k => attToday[k] === "P" && studById.has(k));
+    const totalMarked = Object.keys(attToday).length;
+    if (totalMarked) {
+      const pct = Math.round(presentKeys.length / totalMarked * 100);
+      attSub = `${presentKeys.length}/${totalMarked} present`;
+      attBadge = `<span class="badge ${pct >= 75 ? "green" : "amber"}">${pct}%</span>`;
+    }
+
+    const recentPayments = monthPayments
+      .filter(p => studById.has(p.studentId))
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)))
+      .slice(0, 5);
+
+    body.innerHTML = `
+      <div class="stats-grid">
+        <div class="stat-card accent-blue">
+          <div class="stat-label">Total Students</div>
+          <div class="stat-value">${studs.length}</div>
+          <div class="stat-sub">${active.length} active</div>
+        </div>
+        <div class="stat-card accent-green">
+          <div class="stat-label">Collected (${monthName(month)})</div>
+          <div class="stat-value">${formatMoney(collected)}</div>
+          <div class="stat-sub">of ${formatMoney(expected)} expected</div>
+        </div>
+        <div class="stat-card accent-red">
+          <div class="stat-label">Pending Dues</div>
+          <div class="stat-value">${formatMoney(pending)}</div>
+          <div class="stat-sub">${monthName(month)}</div>
+        </div>
+        <div class="stat-card accent-amber">
+          <div class="stat-label">Today's Attendance</div>
+          <div class="stat-value">${attBadge}</div>
+          <div class="stat-sub">${attSub}</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>Recent Payments</h3></div>
+        ${recentPayments.length ? `
+        <div class="table-wrap"><table>
+          <thead><tr><th>Date</th><th>Student</th><th>Month</th><th>Amount</th><th>Note</th></tr></thead>
+          <tbody>${recentPayments.map(p => {
+            const s = studById.get(p.studentId);
+            return `<tr>
+              <td>${esc(p.date)}</td>
+              <td>${esc(s ? s.name : "Deleted student")}</td>
+              <td>${esc(monthName(p.month))}</td>
+              <td><strong>${formatMoney(p.amount)}</strong></td>
+              <td>${esc(p.note || "—")}</td>
+            </tr>`;
+          }).join("")}</tbody>
+        </table></div>` : `<div class="empty-state">No payments recorded yet.</div>`}
+      </div>
+    `;
+  } catch (err) {
+    console.error(err);
+    body.innerHTML = `<div class="empty-state">Could not load dashboard.</div>`;
   }
-
-  const recentPayments = db.payments
-    .filter(p => studentById(p.studentId)?.section === state.section)
-    .sort((a, b) => b.date.localeCompare(a.date))
-    .slice(0, 5);
-
-  document.getElementById("page-body").innerHTML = `
-    <div class="stats-grid">
-      <div class="stat-card accent-blue">
-        <div class="stat-label">Total Students</div>
-        <div class="stat-value">${studs.length}</div>
-        <div class="stat-sub">${active.length} active</div>
-      </div>
-      <div class="stat-card accent-green">
-        <div class="stat-label">Collected (${monthName(month)})</div>
-        <div class="stat-value">${formatMoney(collected)}</div>
-        <div class="stat-sub">of ${formatMoney(expected)} expected</div>
-      </div>
-      <div class="stat-card accent-red">
-        <div class="stat-label">Pending Dues</div>
-        <div class="stat-value">${formatMoney(pending)}</div>
-        <div class="stat-sub">${monthName(month)}</div>
-      </div>
-      <div class="stat-card accent-amber">
-        <div class="stat-label">Today's Attendance</div>
-        <div class="stat-value">${attBadge}</div>
-        <div class="stat-sub">${attSub}</div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-head"><h3>Recent Payments</h3></div>
-      ${recentPayments.length ? `
-      <div class="table-wrap"><table>
-        <thead><tr><th>Date</th><th>Student</th><th>Month</th><th>Amount</th><th>Note</th></tr></thead>
-        <tbody>${recentPayments.map(p => {
-          const s = studentById(p.studentId);
-          return `<tr>
-            <td>${esc(p.date)}</td>
-            <td>${esc(s ? s.name : "Deleted student")}</td>
-            <td>${esc(monthName(p.month))}</td>
-            <td><strong>${formatMoney(p.amount)}</strong></td>
-            <td>${esc(p.note || "—")}</td>
-          </tr>`;
-        }).join("")}</tbody>
-      </table></div>` : `<div class="empty-state">No payments recorded yet.</div>`}
-    </div>
-  `;
 }
 
 /* =========================================================
    STUDENTS
 ========================================================= */
-function renderStudents() {
-  const prev = document.getElementById("search-input");
-  const hadFocus = document.activeElement === prev;
-  const caret = prev?.selectionStart;
-  const q = (prev?.value || "").toLowerCase();
-  const studs = studentsOf()
+let studentSearchToken = 0; // avoid stale search races
+
+function renderStudentsTable(studs, q) {
+  const filtered = studs
     .filter(s => s.name.toLowerCase().includes(q) || (s.phone || "").includes(q))
     .sort((a, b) => a.name.localeCompare(b.name));
-
   const actions = isAdmin ? `<button class="btn btn-primary" onclick="openStudentForm()">+ Add Student</button>` : "";
-
   document.getElementById("page-actions").innerHTML = actions;
   document.getElementById("page-body").innerHTML = `
     <div class="filter-bar">
       <label>Search
-        <input type="text" id="search-input" placeholder="Name or phone..." value="${esc(q)}" oninput="renderStudents()">
+        <input type="text" id="search-input" placeholder="Name or phone..." value="${esc(q)}" oninput="onStudentSearch()">
       </label>
     </div>
     <div class="card">
-      ${studs.length ? `
+      ${filtered.length ? `
       <div class="table-wrap"><table>
         <thead><tr><th>Name</th><th>Phone</th><th>Batch</th><th>Monthly Fee</th><th>Status</th>${isAdmin ? "<th>Actions</th>" : ""}</tr></thead>
-        <tbody>${studs.map(s => `
+        <tbody>${filtered.map(s => `
           <tr>
             <td><strong>${esc(s.name)}</strong></td>
             <td>${esc(s.phone || "—")}</td>
@@ -231,16 +231,32 @@ function renderStudents() {
       </table></div>` : `<div class="empty-state">No students found.</div>`}
     </div>
   `;
+}
 
-  if (hadFocus) {
-    const input = document.getElementById("search-input");
-    input.focus();
-    input.setSelectionRange(caret, caret);
+let cachedStudents = [];
+
+async function renderStudents() {
+  const body = document.getElementById("page-body");
+  body.innerHTML = `<div class="empty-state">Loading students…</div>`;
+  try {
+    // search happens client-side over one cached, section-scoped query
+    cachedStudents = await DB.fetchStudents(state.section);
+    renderStudentsTable(cachedStudents, "");
+  } catch (err) {
+    console.error(err);
+    body.innerHTML = `<div class="empty-state">Could not load students.</div>`;
   }
 }
 
+window.onStudentSearch = function () {
+  const input = document.getElementById("search-input");
+  const q = (input?.value || "").toLowerCase();
+  renderStudentsTable(cachedStudents, q);
+  input && input.focus(); // keep focus while typing (no re-query needed)
+};
+
 window.openStudentForm = function (id = null) {
-  const s = id ? studentById(id) : null;
+  const s = id ? cachedStudents.find(x => x.id === id) : null;
   openModal(s ? "Edit Student" : "Add Student", `
     <form id="student-form">
       <label>Full Name
@@ -273,6 +289,8 @@ window.openStudentForm = function (id = null) {
 
   document.getElementById("student-form").addEventListener("submit", async e => {
     e.preventDefault();
+    const btn = e.target.querySelector('button[type="submit"]');
+    btn.disabled = true; btn.textContent = "Saving…";
     const f = new FormData(e.target);
     const patch = {
       name: f.get("name").trim(),
@@ -282,93 +300,117 @@ window.openStudentForm = function (id = null) {
       joinDate: f.get("joinDate"),
       active: f.get("active") === "true"
     };
-    if (!patch.name) { toast("Name is required", "error"); return; }
+    if (!patch.name) { toast("Name is required", "error"); btn.disabled = false; btn.textContent = s ? "Save Changes" : "Add Student"; return; }
     try {
-      if (s) {
-        await DB.updateStudent(s.id, patch);
-      } else {
-        await DB.addStudent({ ...patch, section: state.section });
-      }
+      if (s) { await DB.updateStudent(s.id, patch); toast("Student updated"); }
+      else { await DB.addStudent({ ...patch, section: state.section }); toast("Student added to database"); }
       closeModal();
-      toast(s ? "Student updated" : "Student added to database");
     } catch (err) {
       console.error(err);
       toast("Could not save: " + (err.message || err), "error");
+      btn.disabled = false; btn.textContent = s ? "Save Changes" : "Add Student";
       return;
     }
-    render();
+    await renderStudents(); // refresh the list from Supabase
   });
 };
 
 window.deleteStudent = async function (id) {
-  const s = studentById(id);
-  if (!confirm(`Delete "${s.name}"? Their payment history will also be removed.`)) return;
-  await DB.deleteStudent(id);
-  toast("Student deleted");
-  render();
+  const s = cachedStudents.find(x => x.id === id);
+  if (!confirm(`Delete "${s?.name || ""}"? Their attendance and payment history will also be removed.`)) return;
+  try {
+    await DB.deleteStudent(id);
+    toast("Student deleted");
+  } catch (err) {
+    console.error(err);
+    toast("Could not delete: " + (err.message || err), "error");
+    return;
+  }
+  await renderStudents();
 };
 
 /* =========================================================
    FEES
 ========================================================= */
-function renderFees() {
+let feeMonthCache = "";
+let feePaymentsCache = [];
+
+async function renderFees() {
   const month = document.getElementById("fee-month")?.value || monthKey();
-  const studs = studentsOf().sort((a, b) => a.name.localeCompare(b.name));
+  const body = document.getElementById("page-body");
+  body.innerHTML = `<div class="empty-state">Loading fees…</div>`;
 
-  let totalExpected = 0, totalPaid = 0;
+  try {
+    // students + month payments in parallel (both indexed)
+    const [studs, pays] = await Promise.all([
+      DB.fetchStudents(state.section),
+      DB.fetchMonthPayments(month)
+    ]);
+    feeMonthCache = month;
+    feePaymentsCache = pays;
+    const paidMap = new Map();
+    pays.forEach(p => { paidMap.set(p.studentId, (paidMap.get(p.studentId) || 0) + Number(p.amount)); });
 
-  const rows = studs.map(s => {
-    const paid = paidFor(s.id, month);
-    const due = Math.max(Number(s.monthlyFee) - paid, 0);
-    totalExpected += Number(s.monthlyFee);
-    totalPaid += Math.min(paid, Number(s.monthlyFee));
-    const status = paid >= s.monthlyFee ? ["green", "Paid"] : paid > 0 ? ["amber", "Partial"] : ["red", "Unpaid"];
-    return `
-      <tr>
-        <td><strong>${esc(s.name)}</strong></td>
-        <td>${formatMoney(s.monthlyFee)}</td>
-        <td>${formatMoney(paid)}</td>
-        <td>${due > 0 ? `<strong style="color:var(--red)">${formatMoney(due)}</strong>` : "—"}</td>
-        <td><span class="badge ${status[0]}">${status[1]}</span></td>
-        <td class="actions-cell">
-          ${isAdmin && s.active ? `<button class="btn btn-primary btn-sm" onclick="openPaymentForm('${s.id}','${month}')">Record Payment</button>` : ""}
-          <button class="btn btn-outline btn-sm" onclick="openHistory('${s.id}')">History</button>
-        </td>
-      </tr>`;
-  }).join("");
+    const sorted = [...studs].sort((a, b) => a.name.localeCompare(b.name));
+    let totalExpected = 0, totalPaid = 0;
+    const rows = sorted.map(s => {
+      const paid = paidMap.get(s.id) || 0;
+      const due = Math.max(Number(s.monthlyFee) - paid, 0);
+      totalExpected += Number(s.monthlyFee);
+      totalPaid += Math.min(paid, Number(s.monthlyFee));
+      const status = paid >= s.monthlyFee ? ["green", "Paid"] : paid > 0 ? ["amber", "Partial"] : ["red", "Unpaid"];
+      return `
+        <tr>
+          <td><strong>${esc(s.name)}</strong></td>
+          <td>${formatMoney(s.monthlyFee)}</td>
+          <td>${formatMoney(paid)}</td>
+          <td>${due > 0 ? `<strong style="color:var(--red)">${formatMoney(due)}</strong>` : "—"}</td>
+          <td><span class="badge ${status[0]}">${status[1]}</span></td>
+          <td class="actions-cell">
+            ${isAdmin && s.active ? `<button class="btn btn-primary btn-sm" onclick="openPaymentForm('${s.id}','${month}')">Record Payment</button>` : ""}
+            <button class="btn btn-outline btn-sm" onclick="openHistory('${s.id}')">History</button>
+          </td>
+        </tr>`;
+    }).join("");
 
-  document.getElementById("page-body").innerHTML = `
-    <div class="filter-bar">
-      <label>Month
-        <input type="month" id="fee-month" value="${month}" onchange="renderFees()">
-      </label>
-    </div>
-    <div class="stats-grid">
-      <div class="stat-card accent-blue"><div class="stat-label">Expected</div><div class="stat-value">${formatMoney(totalExpected)}</div></div>
-      <div class="stat-card accent-green"><div class="stat-label">Collected</div><div class="stat-value">${formatMoney(totalPaid)}</div></div>
-      <div class="stat-card accent-red"><div class="stat-label">Outstanding</div><div class="stat-value">${formatMoney(Math.max(totalExpected - totalPaid, 0))}</div></div>
-    </div>
-    <div class="card">
-      ${rows ? `
-      <div class="table-wrap"><table>
-        <thead><tr><th>Student</th><th>Monthly Fee</th><th>Paid</th><th>Balance</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table></div>` : `<div class="empty-state">No students in this section yet.</div>`}
-    </div>
-  `;
+    body.innerHTML = `
+      <div class="filter-bar">
+        <label>Month
+          <input type="month" id="fee-month" value="${month}" onchange="renderFees()">
+        </label>
+      </div>
+      <div class="stats-grid">
+        <div class="stat-card accent-blue"><div class="stat-label">Expected</div><div class="stat-value">${formatMoney(totalExpected)}</div></div>
+        <div class="stat-card accent-green"><div class="stat-label">Collected</div><div class="stat-value">${formatMoney(totalPaid)}</div></div>
+        <div class="stat-card accent-red"><div class="stat-label">Outstanding</div><div class="stat-value">${formatMoney(Math.max(totalExpected - totalPaid, 0))}</div></div>
+      </div>
+      <div class="card">
+        ${rows ? `
+        <div class="table-wrap"><table>
+          <thead><tr><th>Student</th><th>Monthly Fee</th><th>Paid</th><th>Balance</th><th>Status</th><th>Actions</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>` : `<div class="empty-state">No students in this section yet.</div>`}
+      </div>
+    `;
+  } catch (err) {
+    console.error(err);
+    body.innerHTML = `<div class="empty-state">Could not load fees.</div>`;
+  }
 }
 
 window.openPaymentForm = function (studentId, month) {
-  const s = studentById(studentId);
-  const alreadyPaid = paidFor(studentId, month);
-  openModal(`Record Payment — ${s.name}`, `
+  const s = cachedStudents.find(x => x.id === studentId);
+  const alreadyPaid = (feePaymentsCache && feeMonthCache === month ? feePaymentsCache : [])
+    .filter(p => p.studentId === studentId)
+    .reduce((sum, p) => sum + Number(p.amount), 0);
+  openModal(`Record Payment — ${s?.name || ""}`, `
     <form id="payment-form">
       <p style="margin-bottom:14px;color:var(--text-muted)">
         Month: <strong>${monthName(month)}</strong> · Already paid: <strong>${formatMoney(alreadyPaid)}</strong> ·
-        Balance: <strong>${formatMoney(Math.max(s.monthlyFee - alreadyPaid, 0))}</strong>
+        Balance: <strong>${formatMoney(Math.max((s?.monthlyFee || 0) - alreadyPaid, 0))}</strong>
       </p>
       <label>Amount
-        <input name="amount" type="number" min="1" required value="${Math.max(s.monthlyFee - alreadyPaid, 0)}">
+        <input name="amount" type="number" min="1" required value="${Math.max((s?.monthlyFee || 0) - alreadyPaid, 0)}">
       </label>
       <label>Date
         <input name="date" type="date" required value="${todayStr()}">
@@ -385,59 +427,77 @@ window.openPaymentForm = function (studentId, month) {
 
   document.getElementById("payment-form").addEventListener("submit", async e => {
     e.preventDefault();
+    const btn = e.target.querySelector('button[type="submit"]');
+    btn.disabled = true; btn.textContent = "Saving…";
     const f = new FormData(e.target);
-    await DB.addPayment({
-      studentId,
-      amount: Number(f.get("amount")),
-      month,
-      date: f.get("date"),
-      note: f.get("note").trim()
-    });
-    closeModal();
-    toast("Payment recorded");
-    render();
+    try {
+      await DB.addPayment({
+        studentId,
+        amount: Number(f.get("amount")),
+        month,
+        date: f.get("date"),
+        note: f.get("note").trim()
+      });
+      closeModal();
+      toast("Payment recorded");
+    } catch (err) {
+      console.error(err);
+      toast("Could not save payment: " + (err.message || err), "error");
+      btn.disabled = false; btn.textContent = "Save Payment";
+      return;
+    }
+    await renderFees();
   });
 };
 
-window.openHistory = function (studentId) {
-  const s = studentById(studentId);
-  const pays = DB.load().payments
-    .filter(p => p.studentId === studentId)
-    .sort((a, b) => b.date.localeCompare(a.date));
-
-  openModal(`Payment History — ${s.name}`, pays.length ? `
-    <div class="table-wrap"><table>
-      <thead><tr><th>Date</th><th>Month</th><th>Amount</th><th>Note</th>${isAdmin ? "<th></th>" : ""}</tr></thead>
-      <tbody>${pays.map(p => `
-        <tr>
-          <td>${esc(p.date)}</td>
-          <td>${esc(monthName(p.month))}</td>
-          <td><strong>${formatMoney(p.amount)}</strong></td>
-          <td>${esc(p.note || "—")}</td>
-          ${isAdmin ? `<td><button class="btn btn-danger btn-sm" onclick="deletePayment('${p.id}','${studentId}')">Delete</button></td>` : ""}
-        </tr>`).join("")}</tbody>
-    </table></div>
-  ` : `<div class="empty-state">No payments recorded for this student.</div>`);
+window.openHistory = async function (studentId) {
+  const s = cachedStudents.find(x => x.id === studentId);
+  openModal(`Payment History — ${s?.name || ""}`, `<div class="empty-state">Loading…</div>`);
+  try {
+    const pays = await DB.fetchStudentPayments(studentId);
+    document.getElementById("modal-body").innerHTML = pays.length ? `
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date</th><th>Month</th><th>Amount</th><th>Note</th>${isAdmin ? "<th></th>" : ""}</tr></thead>
+        <tbody>${pays.map(p => `
+          <tr>
+            <td>${esc(p.date)}</td>
+            <td>${esc(monthName(p.month))}</td>
+            <td><strong>${formatMoney(p.amount)}</strong></td>
+            <td>${esc(p.note || "—")}</td>
+            ${isAdmin ? `<td><button class="btn btn-danger btn-sm" onclick="deletePayment('${p.id}','${studentId}')">Delete</button></td>` : ""}
+          </tr>`).join("")}</tbody>
+      </table></div>
+    ` : `<div class="empty-state">No payments recorded for this student.</div>`;
+  } catch (err) {
+    console.error(err);
+    document.getElementById("modal-body").innerHTML = `<div class="empty-state">Could not load history.</div>`;
+  }
 };
 
 window.deletePayment = async function (payId, studentId) {
   if (!confirm("Delete this payment record?")) return;
-  await DB.deletePayment(payId);
-  toast("Payment deleted");
-  openHistory(studentId);
-  render();
+  try {
+    await DB.deletePayment(payId);
+    toast("Payment deleted");
+  } catch (err) {
+    console.error(err);
+    toast("Could not delete: " + (err.message || err), "error");
+    return;
+  }
+  await openHistory(studentId);
+  await renderFees();
 };
 
 /* =========================================================
    ATTENDANCE
 ========================================================= */
-function renderAttendance() {
-  const date = document.getElementById("att-date")?.value || todayStr();
-  const existing = attendanceFor(date);
-  const records = existing ? { ...existing.records } : {};
-  const studs = studentsOf().filter(s => s.active).sort((a, b) => a.name.localeCompare(b.name));
+let attendanceDateCache = "";
+let attendanceRecordsCache = {};
+let attendanceStudentsCache = [];
 
-  const rows = studs.map(s => {
+function renderAttendanceTable(date, studs, records) {
+  const sorted = [...studs].filter(s => s.active).sort((a, b) => a.name.localeCompare(b.name));
+  const rows = sorted.map(s => {
     const val = records[s.id] || "";
     return `
       <tr>
@@ -452,12 +512,14 @@ function renderAttendance() {
       </tr>`;
   }).join("");
 
+  const hasData = Object.keys(records).length > 0;
+
   document.getElementById("page-body").innerHTML = `
     <div class="filter-bar">
       <label>Date
-        <input type="date" id="att-date" value="${date}" max="${todayStr()}" onchange="renderAttendance()">
+        <input type="date" id="att-date" value="${date}" max="${todayStr()}" onchange="onAttDateChange()">
       </label>
-      ${existing ? `<span class="badge blue" style="align-self:center">Saved — edit and save again to update</span>` : ""}
+      ${hasData ? `<span class="badge blue" style="align-self:center">Saved — edit and save again to update</span>` : ""}
     </div>
     <div class="card">
       ${rows ? `
@@ -468,34 +530,63 @@ function renderAttendance() {
       </table></div>
       <div class="card-body" style="display:flex;justify-content:flex-end;gap:10px">
         <button class="btn btn-outline" onclick="markAll('P')">Mark All Present</button>
-        <button class="btn btn-primary" onclick="saveAttendance('${date}')">Save Attendance</button>
+        <button class="btn btn-primary" onclick="saveAttendance()">Save Attendance</button>
       </div>` : `<div class="empty-state">No active students in this section.</div>`}
     </div>
   `;
-
-  updateAttSummary();
+  updateAttSummary(studs);
   if (rows) {
-    document.getElementById("att-rows").addEventListener("change", updateAttSummary);
+    document.getElementById("att-rows").addEventListener("change", () => updateAttSummary(studs));
   }
 }
 
-function collectAttendance() {
+async function renderAttendance() {
+  const date = document.getElementById("att-date")?.value || todayStr();
+  const body = document.getElementById("page-body");
+  body.innerHTML = `<div class="empty-state">Loading attendance…</div>`;
+  try {
+    // students for the section + attendance for just this date, in parallel
+    const [studs, records] = await Promise.all([
+      DB.fetchStudents(state.section),
+      DB.fetchAttendanceForDate(date)
+    ]);
+    attendanceDateCache = date;
+    attendanceRecordsCache = records || {};
+    attendanceStudentsCache = studs;
+    renderAttendanceTable(date, studs, attendanceRecordsCache);
+  } catch (err) {
+    console.error(err);
+    body.innerHTML = `<div class="empty-state">Could not load attendance.</div>`;
+  }
+}
+
+window.onAttDateChange = function () {
+  const date = document.getElementById("att-date")?.value || todayStr();
+  // fresh query for the newly selected date
+  DB.fetchAttendanceForDate(date).then(records => {
+    attendanceDateCache = date;
+    attendanceRecordsCache = records || {};
+    renderAttendanceTable(date, attendanceStudentsCache, attendanceRecordsCache);
+  }).catch(err => { console.error(err); toast("Could not load that date", "error"); });
+};
+
+function currentAttendance() {
   const records = {};
-  studentsOf().filter(s => s.active).forEach(s => {
+  attendanceStudentsCache.filter(s => s.active).forEach(s => {
     const checked = document.querySelector(`input[name="att_${s.id}"]:checked`);
     if (checked) records[s.id] = checked.value;
   });
   return records;
 }
 
-function updateAttSummary() {
+function updateAttSummary(studs) {
   const box = document.getElementById("att-summary");
   if (!box) return;
-  const recs = collectAttendance();
+  const recs = currentAttendance();
   const vals = Object.values(recs);
   const present = vals.filter(v => v === "P").length;
   const absent = vals.filter(v => v === "A").length;
-  const unmarked = studentsOf().filter(s => s.active).length - vals.length;
+  const unmarked = studs.filter(s => s.active).length - vals.length;
   box.innerHTML = `
     <span>Present: <strong style="color:var(--green)">${present}</strong></span>
     <span>Absent: <strong style="color:var(--red)">${absent}</strong></span>
@@ -504,39 +595,35 @@ function updateAttSummary() {
 }
 
 window.markAll = function (val) {
-  studentsOf().filter(s => s.active).forEach(s => {
+  attendanceStudentsCache.filter(s => s.active).forEach(s => {
     const radio = document.querySelector(`input[name="att_${s.id}"][value="${val}"]`);
     if (radio) radio.checked = true;
   });
-  updateAttSummary();
+  updateAttSummary(attendanceStudentsCache);
 };
 
-window.saveAttendance = async function (date) {
-  const records = collectAttendance();
-  const total = studentsOf().filter(s => s.active).length;
+window.saveAttendance = async function () {
+  const records = currentAttendance();
+  const total = attendanceStudentsCache.filter(s => s.active).length;
   if (Object.keys(records).length < total) {
     if (!confirm("Some students are unmarked. Save anyway?")) return;
   }
-  await DB.saveAttendance(date, state.section, records);
-  toast("Attendance saved");
-  render();
-};
-
-/* ----- boot: load data, then render ----- */
-(async function boot() {
-  const body = document.getElementById("page-body");
-  body.innerHTML = `<div class="empty-state">Loading data…</div>`;
+  const btn = document.querySelector('button[onclick="saveAttendance()"]');
+  if (btn) { btn.disabled = true; btn.textContent = "Saving…"; }
   try {
-    await DB.init();
-    DB.onWriteError = (scope, err) => toast("Save failed — check connection", "error");
-    render();
+    await DB.saveAttendance(attendanceDateCache, records);
+    toast("Attendance saved");
   } catch (err) {
     console.error(err);
-    body.innerHTML = `
-      <div class="empty-state">
-        <p><strong>Could not load data.</strong></p>
-        <p style="margin-top:6px">Check your internet connection or Supabase configuration.</p>
-        <button class="btn btn-primary" style="margin-top:14px" onclick="location.reload()">Retry</button>
-      </div>`;
+    toast("Could not save attendance: " + (err.message || err), "error");
+    if (btn) { btn.disabled = false; btn.textContent = "Save Attendance"; }
+    return;
   }
+  await renderAttendance();
+};
+
+/* ----- boot: just wire the error hook, then render the first page ----- */
+(async function boot() {
+  DB.onWriteError = (scope, err) => toast("Save failed — check connection", "error");
+  await render();
 })();

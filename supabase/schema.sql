@@ -37,6 +37,8 @@ create table if not exists students (
 create index if not exists idx_students_name   on students (lower(name));
 create index if not exists idx_students_course on students (course);
 create index if not exists idx_students_status on students (status);
+-- Composite index for the most common listing query: students in a course, newest first
+create index if not exists idx_students_course_created on students (course, created_at desc);
 
 -- ============================================================================
 -- ATTENDANCE table
@@ -57,6 +59,9 @@ create table if not exists attendance (
 
 create index if not exists idx_attendance_date    on attendance (attendance_date);
 create index if not exists idx_attendance_student on attendance (student_id);
+-- Composite index: the app queries attendance BY DATE for a whole class,
+-- so (attendance_date, student_id) serves those lookups directly.
+create index if not exists idx_attendance_date_student on attendance (attendance_date, student_id);
 
 -- ============================================================================
 -- USERS table (app's own login — admin / tuition / typewriting teachers)
@@ -93,6 +98,8 @@ create table if not exists payments (
 
 create index if not exists idx_payments_student on payments (student_id);
 create index if not exists idx_payments_month   on payments (month);
+-- Composite index: fees page lists payments by month or by (student, month)
+create index if not exists idx_payments_student_month on payments (student_id, month);
 
 -- ============================================================================
 -- updated_at trigger (keeps timestamps current on UPDATE)
