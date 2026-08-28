@@ -84,7 +84,8 @@ function paidFor(studentId, month) {
     .reduce((sum, p) => sum + Number(p.amount), 0);
 }
 function attendanceFor(date, section = state.section) {
-  return DB.load().attendance.find(a => a.date === date && a.section === section);
+  // attendance is stored per date; students already carry their section
+  return DB.load().attendance.find(a => a.date === date);
 }
 
 /* =========================================================
