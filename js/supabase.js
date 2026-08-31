@@ -24,7 +24,7 @@ const SUPABASE_KEY = "sb_publishable_A8ui08QptY1z3J-YW19pHw_ZjY1nEKW";
 /* Diagnostic info so the UI badge (and you) can see exactly WHY the app is
    or isn't connected. Inspect window.SUPABASE_DIAG in the browser console. */
 window.SUPABASE_DIAG = {
-  build: "v11",
+  build: "v12",
   libGlobalType: typeof window.supabase,
   createClientType: typeof (window.supabase && window.supabase.createClient),
   error: null
