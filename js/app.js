@@ -625,5 +625,11 @@ window.saveAttendance = async function () {
 /* ----- boot: just wire the error hook, then render the first page ----- */
 (async function boot() {
   DB.onWriteError = (scope, err) => toast("Save failed — check connection", "error");
+  const modeEl = document.getElementById("data-mode");
+  if (modeEl) {
+    const remote = DB.isRemote ? DB.isRemote() : false;
+    modeEl.textContent = remote ? "● Connected to Supabase" : "● Demo / local only";
+    modeEl.classList.toggle("online", remote);
+  }
   await render();
 })();

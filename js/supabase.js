@@ -25,9 +25,7 @@ const SUPABASE_KEY = "sb_publishable_A8ui08QptY1z3J-YW19pHw_ZjY1nEKW";
 
 /* Create the shared Supabase client used by the whole app.
    Do not edit below this line unless you know what you're doing. */
-const supabase = window.supabase
-  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY)
-  : null;
+const supabase = window.supabase?.createClient?.(SUPABASE_URL, SUPABASE_KEY) ?? null;
 
 let supabaseConfigured = Boolean(supabase);
 window.SUPABASE_CONFIGURED = supabaseConfigured;
