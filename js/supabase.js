@@ -1,18 +1,16 @@
 /* ============================================================================
    SUPABASE CONFIGURATION - THE ONLY PLACE YOU EDIT THINGS
    ============================================================================
-   All Supabase setup is done in this single file. The Supabase JavaScript
-   client is loaded from a CDN in app.html and index.html.
+   The Supabase JS library (js/supabase-js.min.js) is loaded LOCALLY before
+   this file in app.html / index.html - no external CDN is used.
 
-   HOW TO CONNECT (10 minutes):
+   HOW TO POINT AT YOUR OWN PROJECT:
    1. Create a free project at https://supabase.com
    2. Open the SQL Editor and run the file  supabase/schema.sql
    3. Go to Dashboard -> Settings -> API
    4. Copy the "Project URL"   into SUPABASE_URL  below
    5. Copy the "anon" / "public" key (NOT the service_role key)
       into SUPABASE_KEY below
-   6. Save, then open the app. Students & attendance now live in
-      PostgreSQL (Supabase) and persist across devices.
 
    IMPORTANT:
    - Use the PUBLIC (anon) key ONLY. Never use the service_role key here.
@@ -23,9 +21,27 @@
 const SUPABASE_URL = "https://znxtqxhecnmpxylqiqyf.supabase.co";
 const SUPABASE_KEY = "sb_publishable_A8ui08QptY1z3J-YW19pHw_ZjY1nEKW";
 
-/* Create the shared Supabase client used by the whole app.
-   Do not edit below this line unless you know what you're doing. */
-const supabase = window.supabase?.createClient?.(SUPABASE_URL, SUPABASE_KEY) ?? null;
+/* Diagnostic info so the UI badge (and you) can see exactly WHY the app is
+   or isn't connected. Inspect window.SUPABASE_DIAG in the browser console. */
+window.SUPABASE_DIAG = {
+  build: "v11",
+  libGlobalType: typeof window.supabase,
+  createClientType: typeof (window.supabase && window.supabase.createClient),
+  error: null
+};
 
-let supabaseConfigured = Boolean(supabase);
+/* Build the shared Supabase client. Never throws - on any problem the app
+   safely falls back to demo mode and the reason is recorded above. */
+let supabase = null;
+try {
+  if (window.supabase && typeof window.supabase.createClient === "function") {
+    supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  }
+} catch (err) {
+  window.SUPABASE_DIAG.error = String(err && err.message ? err.message : err);
+  supabase = null;
+}
+
+const supabaseConfigured = Boolean(supabase);
 window.SUPABASE_CONFIGURED = supabaseConfigured;
+window.SUPABASE_DIAG.configured = supabaseConfigured;

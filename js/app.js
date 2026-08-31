@@ -628,8 +628,21 @@ window.saveAttendance = async function () {
   const modeEl = document.getElementById("data-mode");
   if (modeEl) {
     const remote = DB.isRemote ? DB.isRemote() : false;
-    modeEl.textContent = remote ? "● Connected to Supabase" : "● Demo / local only";
-    modeEl.classList.toggle("online", remote);
+    const diag = window.SUPABASE_DIAG || {};
+    if (remote) {
+      modeEl.textContent = "● Connected to Supabase";
+      modeEl.classList.toggle("online", true);
+      modeEl.title = "Data is stored in Supabase and shared across all devices.";
+    } else {
+      modeEl.classList.remove("online");
+      let reason = "no supabase lib loaded (old files?)";
+      if (diag.error) reason = "client init error: " + diag.error;
+      else if (diag.createClientType && diag.createClientType !== "function") reason = "supabase lib incomplete";
+      else if (diag.libGlobalType !== "undefined") reason = "unknown - lib loaded but no client";
+      modeEl.textContent = "● Demo / local (v" + (diag.build || "?") + ")";
+      modeEl.title = reason;
+      console.warn("[app] not connected to Supabase (" + (diag.build || "?") + "):", reason, diag);
+    }
   }
   await render();
 })();
